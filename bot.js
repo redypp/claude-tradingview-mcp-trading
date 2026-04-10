@@ -1,9 +1,9 @@
 /**
  * Claude + TradingView MCP — Automated Trading Bot
  *
- * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
- * Binance (free, no auth), calculates all indicators, runs safety check,
- * executes via BitGet if everything lines up.
+ * Strategy: Institutional Accumulation + Insider Buying
+ * Reads indicator values from TradingView (IVB, EMAs, RSI, ATR),
+ * checks insider buying via Finnhub (SEC Form 4), executes via Alpaca.
  *
  * Local mode: run manually — node bot.js
  * Cloud mode: deploy to Railway, set env vars, Railway triggers on cron schedule
@@ -11,13 +11,12 @@
 
 import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
-import crypto from "crypto";
 import { execSync } from "child_process";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
 function checkOnboarding() {
-  const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
+  const required = ["ALPACA_API_KEY", "ALPACA_SECRET_KEY"];
   const missing = required.filter((k) => !process.env[k]);
 
   if (!existsSync(".env")) {
@@ -27,25 +26,27 @@ function checkOnboarding() {
     writeFileSync(
       ".env",
       [
-        "# BitGet credentials",
-        "BITGET_API_KEY=",
-        "BITGET_SECRET_KEY=",
-        "BITGET_PASSPHRASE=",
+        "# Alpaca credentials",
+        "ALPACA_API_KEY=",
+        "ALPACA_SECRET_KEY=",
+        "",
+        "# Finnhub (insider data)",
+        "FINNHUB_API_KEY=",
         "",
         "# Trading config",
         "PORTFOLIO_VALUE_USD=1000",
         "MAX_TRADE_SIZE_USD=100",
         "MAX_TRADES_PER_DAY=3",
         "PAPER_TRADING=true",
-        "SYMBOL=BTCUSDT",
-        "TIMEFRAME=4H",
+        "SYMBOL=SPY",
+        "TIMEFRAME=1D",
       ].join("\n") + "\n",
     );
     try {
       execSync("open .env");
     } catch {}
     console.log(
-      "Fill in your BitGet credentials in .env then re-run: node bot.js\n",
+      "Fill in your credentials in .env then re-run: node bot.js\n",
     );
     process.exit(0);
   }
@@ -60,7 +61,15 @@ function checkOnboarding() {
     process.exit(0);
   }
 
-  // Always print the CSV location so users know where to find their trade log
+  if (!process.env.FINNHUB_API_KEY) {
+    console.log(
+      "\n⚠️  FINNHUB_API_KEY missing — insider data check will be skipped.",
+    );
+    console.log(
+      "   Get a free key at https://finnhub.io/register\n",
+    );
+  }
+
   const csvPath = new URL("trades.csv", import.meta.url).pathname;
   console.log(`\n📄 Trade log: ${csvPath}`);
   console.log(
@@ -72,18 +81,24 @@ function checkOnboarding() {
 // ─── Config ────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  symbol: process.env.SYMBOL || "BTCUSDT",
-  timeframe: process.env.TIMEFRAME || "4H",
+  symbol: process.env.SYMBOL || "SPY",
+  timeframe: process.env.TIMEFRAME || "1D",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
-  tradeMode: process.env.TRADE_MODE || "spot",
-  bitget: {
-    apiKey: process.env.BITGET_API_KEY,
-    secretKey: process.env.BITGET_SECRET_KEY,
-    passphrase: process.env.BITGET_PASSPHRASE,
-    baseUrl: process.env.BITGET_BASE_URL || "https://api.bitget.com",
+  alpaca: {
+    apiKey: process.env.ALPACA_API_KEY,
+    secretKey: process.env.ALPACA_SECRET_KEY,
+    get baseUrl() {
+      return CONFIG.paperTrading
+        ? "https://paper-api.alpaca.markets"
+        : "https://api.alpaca.markets";
+    },
+    dataUrl: "https://data.alpaca.markets",
+  },
+  finnhub: {
+    apiKey: process.env.FINNHUB_API_KEY,
   },
 };
 
@@ -107,35 +122,65 @@ function countTodaysTrades(log) {
   ).length;
 }
 
-// ─── Market Data (Binance public API — free, no auth) ───────────────────────
+// ─── Market Data (Alpaca Data API) ──────────────────────────────────────────
 
 async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
   const intervalMap = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1H": "1h",
-    "4H": "4h",
-    "1D": "1d",
-    "1W": "1w",
+    "1m": "1Min",
+    "5m": "5Min",
+    "15m": "15Min",
+    "30m": "30Min",
+    "1H": "1Hour",
+    "4H": "4Hour",
+    "1D": "1Day",
+    "1W": "1Week",
   };
-  const binanceInterval = intervalMap[interval] || "1m";
+  const alpacaTimeframe = intervalMap[interval] || "1Day";
 
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
+  const isCrypto = symbol.includes("/");
+  const endpoint = isCrypto
+    ? `/v1beta3/crypto/us/bars`
+    : `/v2/stocks/${symbol}/bars`;
+
+  // Calculate date range — go back far enough for SMA(200) on daily
+  const end = new Date().toISOString().slice(0, 10);
+  const msBack = interval === "1D" || interval === "1W"
+    ? 400 * 24 * 60 * 60 * 1000   // ~400 days for daily
+    : 30 * 24 * 60 * 60 * 1000;   // 30 days for intraday
+  const start = new Date(Date.now() - msBack).toISOString().slice(0, 10);
+
+  const params = new URLSearchParams({
+    timeframe: alpacaTimeframe,
+    limit: limit.toString(),
+    start,
+    end,
+  });
+  if (isCrypto) {
+    params.set("symbols", symbol);
+  } else {
+    params.set("feed", "iex");
+    params.set("adjustment", "raw");
+  }
+
+  const url = `${CONFIG.alpaca.dataUrl}${endpoint}?${params}`;
+  const res = await fetch(url, {
+    headers: {
+      "APCA-API-KEY-ID": CONFIG.alpaca.apiKey,
+      "APCA-API-SECRET-KEY": CONFIG.alpaca.secretKey,
+    },
+  });
+  if (!res.ok) throw new Error(`Alpaca Data API error: ${res.status} ${await res.text()}`);
   const data = await res.json();
 
-  return data.map((k) => ({
-    time: k[0],
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
+  const bars = isCrypto ? (data.bars[symbol] || []) : (data.bars || []);
+
+  return bars.map((b) => ({
+    time: new Date(b.t).getTime(),
+    open: b.o,
+    high: b.h,
+    low: b.l,
+    close: b.c,
+    volume: b.v,
   }));
 }
 
@@ -148,6 +193,12 @@ function calcEMA(closes, period) {
     ema = closes[i] * multiplier + ema * (1 - multiplier);
   }
   return ema;
+}
+
+function calcSMA(closes, period) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(closes.length - period);
+  return slice.reduce((a, b) => a + b, 0) / period;
 }
 
 function calcRSI(closes, period = 14) {
@@ -166,23 +217,261 @@ function calcRSI(closes, period = 14) {
   return 100 - 100 / (1 + rs);
 }
 
-// VWAP — session-based, resets at midnight UTC
-function calcVWAP(candles) {
-  const midnightUTC = new Date();
-  midnightUTC.setUTCHours(0, 0, 0, 0);
-  const sessionCandles = candles.filter((c) => c.time >= midnightUTC.getTime());
-  if (sessionCandles.length === 0) return null;
-  const cumTPV = sessionCandles.reduce(
-    (sum, c) => sum + ((c.high + c.low + c.close) / 3) * c.volume,
-    0,
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i];
+    const prevClose = candles[i - 1].close;
+    const tr = Math.max(
+      c.high - c.low,
+      Math.abs(c.high - prevClose),
+      Math.abs(c.low - prevClose),
+    );
+    trs.push(tr);
+  }
+  const recent = trs.slice(trs.length - period);
+  return recent.reduce((a, b) => a + b, 0) / period;
+}
+
+function calcRVOL(candles, period = 20) {
+  if (candles.length < period + 1) return null;
+  const currentVol = candles[candles.length - 1].volume;
+  const avgVol =
+    candles
+      .slice(candles.length - period - 1, candles.length - 1)
+      .reduce((sum, c) => sum + c.volume, 0) / period;
+  return avgVol === 0 ? null : currentVol / avgVol;
+}
+
+function calcClosePosition(candle) {
+  const range = candle.high - candle.low;
+  if (range === 0) return 50;
+  return ((candle.close - candle.low) / range) * 100;
+}
+
+// ─── Insider Data (Finnhub — SEC Form 4 Filings) ───────────────────────────
+
+async function fetchInsiderTransactions(symbol) {
+  if (!CONFIG.finnhub.apiKey) {
+    return { available: false, reason: "No FINNHUB_API_KEY configured" };
+  }
+
+  const url = `https://finnhub.io/api/v1/stock/insider-transactions?symbol=${symbol}&token=${CONFIG.finnhub.apiKey}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    return { available: false, reason: `Finnhub API error: ${res.status}` };
+  }
+
+  const data = await res.json();
+  const transactions = data.data || [];
+
+  // Filter to last 90 days
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 90);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+  const recent = transactions.filter(
+    (t) => t.transactionDate >= cutoffStr,
   );
-  const cumVol = sessionCandles.reduce((sum, c) => sum + c.volume, 0);
-  return cumVol === 0 ? null : cumTPV / cumVol;
+
+  // Count buys vs sells (acquisition = buy, disposition = sell)
+  const buys = recent.filter(
+    (t) => t.transactionCode === "P" || t.transactionCode === "A",
+  );
+  const sells = recent.filter(
+    (t) => t.transactionCode === "S" || t.transactionCode === "D",
+  );
+
+  const buyShares = buys.reduce((sum, t) => sum + Math.abs(t.share || 0), 0);
+  const sellShares = sells.reduce((sum, t) => sum + Math.abs(t.share || 0), 0);
+  const netBuying = buyShares > sellShares;
+
+  return {
+    available: true,
+    totalTransactions: recent.length,
+    buys: buys.length,
+    sells: sells.length,
+    buyShares,
+    sellShares,
+    netBuying,
+    recentBuyers: buys.slice(0, 5).map((t) => ({
+      name: t.name,
+      shares: t.share,
+      date: t.transactionDate,
+    })),
+  };
+}
+
+// ─── Stock Screener ─────────────────────────────────────────────────────────
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function loadUniverse() {
+  if (!existsSync("universe.json")) {
+    console.log("  ⚠️  No universe.json found — falling back to single symbol mode.");
+    return null;
+  }
+  const data = JSON.parse(readFileSync("universe.json", "utf8"));
+  return data.symbols;
+}
+
+// Step 1: Scan all stocks for insider buying (Finnhub, rate-limited)
+// V5 strategy: require 5+ insider buys for strong conviction
+async function screenInsiderBuying(symbols) {
+  console.log(`\n── Insider Scan: Screening ${symbols.length} stocks ─────────────\n`);
+
+  const BATCH_SIZE = 30;  // Finnhub free tier: 60 calls/min — stay safe
+  const BATCH_DELAY_MS = 31000;  // Wait 31s between batches
+  const MIN_INSIDER_BUYS = 5;  // V5: require heavy insider buying
+  const candidates = [];
+
+  for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+    const batch = symbols.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(symbols.length / BATCH_SIZE);
+
+    console.log(`  Batch ${batchNum}/${totalBatches}: scanning ${batch.join(", ").slice(0, 80)}...`);
+
+    const results = await Promise.all(
+      batch.map(async (symbol) => {
+        try {
+          const data = await fetchInsiderTransactions(symbol);
+          if (data.available && data.buys >= MIN_INSIDER_BUYS && data.netBuying) {
+            return { symbol, insiderData: data };
+          }
+        } catch {
+          // Skip symbols that fail
+        }
+        return null;
+      }),
+    );
+
+    const hits = results.filter(Boolean);
+    candidates.push(...hits);
+
+    if (hits.length > 0) {
+      console.log(`    → Found ${hits.length}: ${hits.map((h) => `${h.symbol}(${h.insiderData.buys})`).join(", ")}`);
+    }
+
+    // Rate limit: wait between batches (skip after last batch)
+    if (i + BATCH_SIZE < symbols.length) {
+      console.log(`    ⏳ Rate limit pause (${BATCH_DELAY_MS / 1000}s)...`);
+      await sleep(BATCH_DELAY_MS);
+    }
+  }
+
+  console.log(`\n  Insider scan complete: ${candidates.length} stocks with 5+ insider buys\n`);
+  return candidates;
+}
+
+// Step 2: Run technical filter on insider candidates
+async function screenTechnicals(candidates) {
+  console.log(`── Technical Filter: Checking ${candidates.length} insider picks ──\n`);
+
+  const scored = [];
+
+  for (const { symbol, insiderData } of candidates) {
+    try {
+      const candles = await fetchCandles(symbol, CONFIG.timeframe, 250);
+      if (!candles || candles.length < 200) {
+        console.log(`  ${symbol}: skipped — not enough data (${candles ? candles.length : 0} bars)`);
+        continue;
+      }
+
+      const closes = candles.map((c) => c.close);
+      const price = closes[closes.length - 1];
+      const latestCandle = candles[candles.length - 1];
+
+      const ema10 = calcEMA(closes, 10);
+      const ema21 = calcEMA(closes, 21);
+      const sma50 = calcSMA(closes, 50);
+      const sma200 = calcSMA(closes, 200);
+      const rsi = calcRSI(closes, 14);
+      const atr = calcATR(candles, 14);
+      const rvol = calcRVOL(candles, 20);
+      const closePos = calcClosePosition(latestCandle);
+
+      if (!sma200 || !rsi) continue;
+
+      // V5 conditions: simplified trend + relaxed RSI
+      const trendUp = ema10 > ema21;
+      const aboveSMA200 = price > sma200;
+      const rsiPass = rsi > 35 && rsi < 70;
+
+      const conditions = [trendUp, aboveSMA200, rsiPass];
+      const passCount = conditions.filter(Boolean).length;
+
+      // Score: technical conditions (0-3) * 10 + insider strength bonus
+      const insiderScore = Math.min(insiderData.buys, 20);  // Cap at 20
+      const totalScore = passCount * 10 + insiderScore;
+
+      const status = passCount === 3 ? "✅ ALL PASS" : `${passCount}/3 conditions`;
+
+      console.log(
+        `  ${symbol.padEnd(6)} | ${status} | ` +
+        `Insiders: ${insiderData.buys} buys | ` +
+        `EMA10${ema10 > ema21 ? ">" : "<"}EMA21 | ` +
+        `RSI: ${rsi.toFixed(0)} | ` +
+        `Score: ${totalScore}`,
+      );
+
+      scored.push({
+        symbol,
+        price,
+        indicators: { ema10, ema21, sma50, sma200, rsi, atr, rvol, closePos },
+        insiderData,
+        passCount,
+        allPass: passCount === 3,
+        totalScore,
+      });
+    } catch (err) {
+      console.log(`  ${symbol}: error — ${err.message}`);
+    }
+  }
+
+  // Sort by score (highest first), then by pass count
+  scored.sort((a, b) => b.totalScore - a.totalScore || b.passCount - a.passCount);
+
+  return scored;
+}
+
+// Step 3: Run the full screener pipeline
+async function runScreener() {
+  const symbols = await loadUniverse();
+  if (!symbols) return null;
+
+  // Step 1: Insider scan
+  const insiderPicks = await screenInsiderBuying(symbols);
+  if (insiderPicks.length === 0) {
+    console.log("  No stocks with insider buying found. No trades today.");
+    return [];
+  }
+
+  // Step 2: Technical filter
+  const ranked = await screenTechnicals(insiderPicks);
+
+  // Show top 10 results
+  console.log("\n── Top Candidates (ranked by score) ─────────────────────\n");
+  const top10 = ranked.slice(0, 10);
+  top10.forEach((s, i) => {
+    const badge = s.allPass ? "🟢 READY" : "🟡 WAIT ";
+    console.log(
+      `  ${i + 1}. ${badge} ${s.symbol.padEnd(6)} | ` +
+      `Score: ${s.totalScore} | ${s.passCount}/3 technical | ` +
+      `${s.insiderData.buys} insider buys | ` +
+      `$${s.price.toFixed(2)}`,
+    );
+  });
+
+  return ranked;
 }
 
 // ─── Safety Check ───────────────────────────────────────────────────────────
 
-function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
+function runSafetyCheck(indicators, insiderData) {
   const results = [];
 
   const check = (label, required, actual, pass) => {
@@ -192,90 +481,72 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
     console.log(`     Required: ${required} | Actual: ${actual}`);
   };
 
-  console.log("\n── Safety Check ─────────────────────────────────────────\n");
+  console.log("\n── Safety Check (V5: Heavy Insiders) ────────────────────\n");
 
-  // Determine bias first
-  const bullishBias = price > vwap && price > ema8;
-  const bearishBias = price < vwap && price < ema8;
+  const { price, ema10, ema21, sma50, sma200, rsi, atr, rvol, closePos } = indicators;
 
-  if (bullishBias) {
-    console.log("  Bias: BULLISH — checking long entry conditions\n");
+  // V5: Simplified trend — just EMA10 > EMA21 + above SMA200
+  const trendUp = ema10 > ema21;
+  const aboveSMA200 = price > sma200;
 
-    // 1. Price above VWAP
+  if (trendUp && aboveSMA200) {
+    console.log("  Bias: BULLISH — checking entry conditions\n");
+
+    // 1. EMA10 > EMA21 (short-term uptrend)
     check(
-      "Price above VWAP (buyers in control)",
-      `> ${vwap.toFixed(2)}`,
+      "EMA(10) > EMA(21) (short-term trend up)",
+      `EMA10 > EMA21`,
+      `EMA10: ${ema10.toFixed(2)} | EMA21: ${ema21.toFixed(2)}`,
+      trendUp,
+    );
+
+    // 2. Price above SMA 200
+    check(
+      "Price above SMA 200 (long-term uptrend)",
+      `> ${sma200.toFixed(2)}`,
       price.toFixed(2),
-      price > vwap,
+      aboveSMA200,
     );
 
-    // 2. Price above EMA(8)
+    // 3. RSI between 35-70 (wider range than before)
     check(
-      "Price above EMA(8) (uptrend confirmed)",
-      `> ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price > ema8,
+      "RSI(14) between 35-70 (not overbought)",
+      "35 < RSI < 70",
+      rsi ? rsi.toFixed(2) : "N/A",
+      rsi !== null && rsi > 35 && rsi < 70,
     );
 
-    // 3. RSI(3) pullback
-    check(
-      "RSI(3) below 30 (snap-back setup in uptrend)",
-      "< 30",
-      rsi3.toFixed(2),
-      rsi3 < 30,
-    );
+    // 4. Heavy insider buying (5+ buys in 90 days)
+    if (insiderData.available) {
+      check(
+        "Heavy insider buying (5+ purchases in 90 days)",
+        ">= 5 insider buys, net buying",
+        `${insiderData.buys} buys, ${insiderData.sells} sells (net: ${insiderData.netBuying ? "BUYING" : "SELLING"})`,
+        insiderData.buys >= 5 && insiderData.netBuying,
+      );
+    } else {
+      check(
+        "Heavy insider buying (5+ purchases in 90 days)",
+        "Data available",
+        insiderData.reason,
+        false,
+      );
+    }
 
-    // 4. Not overextended from VWAP
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
-  } else if (bearishBias) {
-    console.log("  Bias: BEARISH — checking short entry conditions\n");
-
-    check(
-      "Price below VWAP (sellers in control)",
-      `< ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price < vwap,
-    );
-
-    check(
-      "Price below EMA(8) (downtrend confirmed)",
-      `< ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price < ema8,
-    );
-
-    check(
-      "RSI(3) above 70 (reversal setup in downtrend)",
-      "> 70",
-      rsi3.toFixed(2),
-      rsi3 > 70,
-    );
-
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
   } else {
-    console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
+    console.log("  Bias: NO ENTRY — trend conditions not met.\n");
+    console.log(`     EMA10: ${ema10.toFixed(2)} | EMA21: ${ema21.toFixed(2)} | SMA200: ${sma200.toFixed(2)}`);
+    console.log(`     Price: ${price.toFixed(2)} | EMA10>EMA21: ${trendUp ? "YES" : "NO"} | Above SMA200: ${aboveSMA200 ? "YES" : "NO"}`);
     results.push({
-      label: "Market bias",
-      required: "Bullish or bearish",
-      actual: "Neutral",
+      label: "Trend direction",
+      required: "EMA10 > EMA21 and price > SMA200",
+      actual: `EMA10${trendUp ? ">" : "<"}EMA21, price ${aboveSMA200 ? "above" : "below"} SMA200`,
       pass: false,
     });
   }
 
   const allPass = results.every((r) => r.pass);
-  return { results, allPass };
+  return { results, allPass, bias: trendUp && aboveSMA200 ? "BULLISH" : "NEUTRAL" };
 }
 
 // ─── Trade Limits ────────────────────────────────────────────────────────────
@@ -315,63 +586,39 @@ function checkTradeLimits(log) {
   return true;
 }
 
-// ─── BitGet Execution ────────────────────────────────────────────────────────
+// ─── Alpaca Execution ───────────────────────────────────────────────────────
 
-function signBitGet(timestamp, method, path, body = "") {
-  const message = `${timestamp}${method}${path}${body}`;
-  return crypto
-    .createHmac("sha256", CONFIG.bitget.secretKey)
-    .update(message)
-    .digest("base64");
-}
-
-async function placeBitGetOrder(symbol, side, sizeUSD, price) {
-  const quantity = (sizeUSD / price).toFixed(6);
-  const timestamp = Date.now().toString();
-  const path =
-    CONFIG.tradeMode === "spot"
-      ? "/api/v2/spot/trade/placeOrder"
-      : "/api/v2/mix/order/placeOrder";
-
+async function placeAlpacaOrder(symbol, side, sizeUSD, price) {
   const body = JSON.stringify({
-    symbol,
+    symbol: symbol.replace("/", ""),
     side,
-    orderType: "market",
-    quantity,
-    ...(CONFIG.tradeMode === "futures" && {
-      productType: "USDT-FUTURES",
-      marginMode: "isolated",
-      marginCoin: "USDT",
-    }),
+    type: "market",
+    time_in_force: "day",
+    notional: sizeUSD.toFixed(2),
   });
 
-  const signature = signBitGet(timestamp, "POST", path, body);
-
-  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
+  const res = await fetch(`${CONFIG.alpaca.baseUrl}/v2/orders`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "ACCESS-KEY": CONFIG.bitget.apiKey,
-      "ACCESS-SIGN": signature,
-      "ACCESS-TIMESTAMP": timestamp,
-      "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
+      "APCA-API-KEY-ID": CONFIG.alpaca.apiKey,
+      "APCA-API-SECRET-KEY": CONFIG.alpaca.secretKey,
     },
     body,
   });
 
   const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
+  if (!res.ok) {
+    throw new Error(`Alpaca order failed: ${data.message || JSON.stringify(data)}`);
   }
 
-  return data.data;
+  return { orderId: data.id, status: data.status };
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
 
 const CSV_FILE = "trades.csv";
 
-// Always ensure trades.csv exists with headers — open it in Excel/Sheets any time
 function initCsv() {
   if (!existsSync(CSV_FILE)) {
     const funnyNote = `,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
@@ -420,7 +667,7 @@ function writeTradeCsv(logEntry) {
     orderId = "BLOCKED";
     notes = `Failed: ${failed}`;
   } else if (logEntry.paperTrading) {
-    side = "BUY";
+    side = logEntry.bias === "BEARISH" ? "SELL" : "BUY";
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
     fee = (logEntry.tradeSize * 0.001).toFixed(4);
@@ -429,7 +676,7 @@ function writeTradeCsv(logEntry) {
     mode = "PAPER";
     notes = "All conditions met";
   } else {
-    side = "BUY";
+    side = logEntry.bias === "BEARISH" ? "SELL" : "BUY";
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
     fee = (logEntry.tradeSize * 0.001).toFixed(4);
@@ -442,7 +689,7 @@ function writeTradeCsv(logEntry) {
   const row = [
     date,
     time,
-    "BitGet",
+    "Alpaca",
     logEntry.symbol,
     side,
     quantity,
@@ -463,7 +710,6 @@ function writeTradeCsv(logEntry) {
   console.log(`Tax record saved → ${CSV_FILE}`);
 }
 
-// Tax summary command: node bot.js --tax-summary
 function generateTaxSummary() {
   if (!existsSync(CSV_FILE)) {
     console.log("No trades.csv found — no trades have been recorded yet.");
@@ -491,55 +737,69 @@ function generateTaxSummary() {
   console.log("─────────────────────────────────────────────────────────\n");
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+// ─── Execute Trade on a Single Symbol ───────────────────────────────────────
 
-async function run() {
-  checkOnboarding();
-  initCsv();
-  console.log("═══════════════════════════════════════════════════════════");
-  console.log("  Claude Trading Bot");
-  console.log(`  ${new Date().toISOString()}`);
-  console.log(
-    `  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`,
-  );
-  console.log("═══════════════════════════════════════════════════════════");
+async function evaluateAndTrade(symbol, log) {
+  console.log(`\n══ Evaluating ${symbol} ══════════════════════════════════════\n`);
 
-  // Load strategy
-  const rules = JSON.parse(readFileSync("rules.json", "utf8"));
-  console.log(`\nStrategy: ${rules.strategy.name}`);
-  console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
-
-  // Load log and check daily limits
-  const log = loadLog();
-  const withinLimits = checkTradeLimits(log);
-  if (!withinLimits) {
-    console.log("\nBot stopping — trade limits reached for today.");
-    return;
+  // Fetch candle data
+  console.log("── Fetching market data from Alpaca ────────────────────\n");
+  const candles = await fetchCandles(symbol, CONFIG.timeframe, 250);
+  if (!candles || candles.length < 200) {
+    console.log(`  ⚠️  Not enough data for ${symbol} (${candles ? candles.length : 0} bars). Skipping.`);
+    return null;
   }
-
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
   const closes = candles.map((c) => c.close);
   const price = closes[closes.length - 1];
+  const latestCandle = candles[candles.length - 1];
   console.log(`  Current price: $${price.toFixed(2)}`);
 
   // Calculate indicators
-  const ema8 = calcEMA(closes, 8);
-  const vwap = calcVWAP(candles);
-  const rsi3 = calcRSI(closes, 3);
+  const ema10 = calcEMA(closes, 10);
+  const ema21 = calcEMA(closes, 21);
+  const sma50 = calcSMA(closes, 50);
+  const sma200 = calcSMA(closes, 200);
+  const rsi = calcRSI(closes, 14);
+  const atr = calcATR(candles, 14);
+  const rvol = calcRVOL(candles, 20);
+  const closePos = calcClosePosition(latestCandle);
 
-  console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
-  console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
+  console.log(`  EMA(10):  $${ema10.toFixed(2)}`);
+  console.log(`  EMA(21):  $${ema21.toFixed(2)}`);
+  console.log(`  SMA(50):  ${sma50 ? "$" + sma50.toFixed(2) : "N/A"}`);
+  console.log(`  SMA(200): ${sma200 ? "$" + sma200.toFixed(2) : "N/A"}`);
+  console.log(`  RSI(14):  ${rsi ? rsi.toFixed(2) : "N/A"}`);
+  console.log(`  ATR(14):  ${atr ? "$" + atr.toFixed(2) : "N/A"}`);
+  console.log(`  RVOL:     ${rvol ? rvol.toFixed(2) + "x" : "N/A"}`);
+  console.log(`  Close Pos: ${closePos.toFixed(1)}%`);
 
-  if (!vwap || !rsi3) {
-    console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
-    return;
+  if (!sma200 || !rsi) {
+    console.log("  ⚠️  Not enough data to calculate all indicators. Skipping.");
+    return null;
+  }
+
+  // Fetch insider data
+  console.log("\n── Checking Insider Activity (SEC Form 4) ──────────────\n");
+  const insiderData = await fetchInsiderTransactions(symbol);
+
+  if (insiderData.available) {
+    console.log(`  Transactions (90 days): ${insiderData.totalTransactions}`);
+    console.log(`  Insider buys:  ${insiderData.buys} (${insiderData.buyShares.toLocaleString()} shares)`);
+    console.log(`  Insider sells: ${insiderData.sells} (${insiderData.sellShares.toLocaleString()} shares)`);
+    console.log(`  Net activity:  ${insiderData.netBuying ? "BUYING" : "SELLING"}`);
+    if (insiderData.recentBuyers.length > 0) {
+      console.log(`  Recent buyers:`);
+      insiderData.recentBuyers.forEach((b) => {
+        console.log(`    - ${b.name}: ${Math.abs(b.shares).toLocaleString()} shares on ${b.date}`);
+      });
+    }
+  } else {
+    console.log(`  ⚠️  ${insiderData.reason}`);
   }
 
   // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+  const indicators = { price, ema10, ema21, sma50, sma200, rsi, atr, rvol, closePos };
+  const { results, allPass, bias } = runSafetyCheck(indicators, insiderData);
 
   // Calculate position size
   const tradeSize = Math.min(
@@ -552,10 +812,16 @@ async function run() {
 
   const logEntry = {
     timestamp: new Date().toISOString(),
-    symbol: CONFIG.symbol,
+    symbol,
     timeframe: CONFIG.timeframe,
     price,
-    indicators: { ema8, vwap, rsi3 },
+    bias,
+    indicators: { ema10, ema21, sma50, sma200, rsi, atr, rvol, closePos },
+    insiderData: insiderData.available ? {
+      buys: insiderData.buys,
+      sells: insiderData.sells,
+      netBuying: insiderData.netBuying,
+    } : null,
     conditions: results,
     allPass,
     tradeSize,
@@ -571,30 +837,26 @@ async function run() {
 
   if (!allPass) {
     const failed = results.filter((r) => !r.pass).map((r) => r.label);
-    console.log(`🚫 TRADE BLOCKED`);
+    console.log(`🚫 TRADE BLOCKED — ${symbol}`);
     console.log(`   Failed conditions:`);
     failed.forEach((f) => console.log(`   - ${f}`));
   } else {
-    console.log(`✅ ALL CONDITIONS MET`);
+    const side = bias === "BEARISH" ? "sell" : "buy";
+    console.log(`✅ ALL CONDITIONS MET — ${symbol} ${bias}`);
 
     if (CONFIG.paperTrading) {
       console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
+        `\n📋 PAPER TRADE — would ${side} ${symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
     } else {
       console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
+        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side.toUpperCase()} ${symbol}`,
       );
       try {
-        const order = await placeBitGetOrder(
-          CONFIG.symbol,
-          "buy",
-          tradeSize,
-          price,
-        );
+        const order = await placeAlpacaOrder(symbol, side, tradeSize, price);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         console.log(`✅ ORDER PLACED — ${order.orderId}`);
@@ -605,14 +867,98 @@ async function run() {
     }
   }
 
-  // Save decision log
+  // Stop loss info
+  if (allPass && atr) {
+    const slPrice = bias === "BEARISH"
+      ? price + 1.5 * atr
+      : price - 1.5 * atr;
+    console.log(`\n   Stop loss: $${slPrice.toFixed(2)} (1.5x ATR = $${(1.5 * atr).toFixed(2)})`);
+  }
+
+  // Save to log
   log.trades.push(logEntry);
   saveLog(log);
-  console.log(`\nDecision log saved → ${LOG_FILE}`);
-
-  // Write tax CSV row for every run (executed, paper, or blocked)
   writeTradeCsv(logEntry);
 
+  return logEntry;
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
+async function run() {
+  checkOnboarding();
+  initCsv();
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("  Claude Trading Bot — Institutional + Insider Strategy");
+  console.log(`  ${new Date().toISOString()}`);
+  console.log(
+    `  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`,
+  );
+  console.log("═══════════════════════════════════════════════════════════");
+
+  const rules = JSON.parse(readFileSync("rules.json", "utf8"));
+  console.log(`\nStrategy: ${rules.strategy.name}`);
+  console.log(`Timeframe: ${CONFIG.timeframe}`);
+
+  // Load log and check daily limits
+  const log = loadLog();
+  const withinLimits = checkTradeLimits(log);
+  if (!withinLimits) {
+    console.log("\nBot stopping — trade limits reached for today.");
+    return;
+  }
+
+  const screenerMode = process.argv.includes("--scan") || existsSync("universe.json");
+  const singleSymbol = process.argv.find((a) => a.startsWith("--symbol="));
+
+  if (singleSymbol) {
+    // Single symbol mode: node bot.js --symbol=LLY
+    const symbol = singleSymbol.split("=")[1];
+    console.log(`\nMode: Single symbol — ${symbol}`);
+    await evaluateAndTrade(symbol, log);
+
+  } else if (screenerMode) {
+    // Screener mode: scan universe for best trades
+    console.log(`\nMode: Screener — scanning S&P 500 for institutional accumulation`);
+
+    const ranked = await runScreener();
+    if (!ranked || ranked.length === 0) {
+      console.log("\nNo candidates found. No trades today.");
+      console.log("═══════════════════════════════════════════════════════════\n");
+      return;
+    }
+
+    // Trade the top candidates that pass all conditions (up to daily limit)
+    const readyToTrade = ranked.filter((s) => s.allPass);
+    const tradesRemaining = CONFIG.maxTradesPerDay - countTodaysTrades(log);
+
+    if (readyToTrade.length === 0) {
+      console.log("\n── No stocks pass all conditions today ──────────────────");
+      console.log("  Closest candidates (waiting for conditions to align):");
+      ranked.slice(0, 5).forEach((s) => {
+        console.log(`    ${s.symbol}: ${s.passCount}/3 conditions, ${s.insiderData.buys} insider buys`);
+      });
+      console.log("\n  The bot will check again at the next scheduled run.");
+    } else {
+      console.log(`\n── ${readyToTrade.length} stocks pass all conditions — trading top ${Math.min(readyToTrade.length, tradesRemaining)} ──\n`);
+
+      for (const candidate of readyToTrade.slice(0, tradesRemaining)) {
+        if (countTodaysTrades(log) >= CONFIG.maxTradesPerDay) {
+          console.log("  Daily trade limit reached — stopping.");
+          break;
+        }
+        await evaluateAndTrade(candidate.symbol, log);
+      }
+    }
+
+  } else {
+    // Fallback: single symbol from .env
+    console.log(`\nMode: Single symbol — ${CONFIG.symbol}`);
+    console.log(`  (Add universe.json or run with --scan to enable screener mode)`);
+    await evaluateAndTrade(CONFIG.symbol, log);
+  }
+
+  console.log(`\nDecision log saved → ${LOG_FILE}`);
   console.log("═══════════════════════════════════════════════════════════\n");
 }
 
