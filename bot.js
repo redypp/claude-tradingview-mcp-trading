@@ -100,9 +100,94 @@ const CONFIG = {
   finnhub: {
     apiKey: process.env.FINNHUB_API_KEY,
   },
+  telegram: {
+    token: process.env.TELEGRAM_BOT_TOKEN,
+    chatId: process.env.TELEGRAM_CHAT_ID,
+  },
 };
 
 const LOG_FILE = "safety-check-log.json";
+
+// ─── Telegram Alerts ────────────────────────────────────────────────────────
+
+async function sendTelegram(message) {
+  if (!CONFIG.telegram.token || !CONFIG.telegram.chatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${CONFIG.telegram.token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: CONFIG.telegram.chatId,
+        text: message,
+        parse_mode: "HTML",
+      }),
+    });
+  } catch (err) {
+    console.log(`  Telegram error: ${err.message}`);
+  }
+}
+
+async function notifyTradeExecuted(symbol, side, price, size, orderId, bias) {
+  const icon = side === "buy" ? "🟢" : "🔴";
+  const mode = CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE";
+  await sendTelegram(
+    `${icon} <b>TRADE PLACED</b>\n\n` +
+    `Symbol: <b>${symbol}</b>\n` +
+    `Side: ${side.toUpperCase()}\n` +
+    `Price: $${price.toFixed(2)}\n` +
+    `Size: $${size.toFixed(2)}\n` +
+    `Bias: ${bias}\n` +
+    `Mode: ${mode}\n` +
+    `Order: ${orderId}`
+  );
+}
+
+async function notifyBlocked(symbol, failedConditions, indicators) {
+  const failed = failedConditions.join("\n• ");
+  await sendTelegram(
+    `🚫 <b>TRADE BLOCKED</b> — ${symbol}\n\n` +
+    `Failed:\n• ${failed}\n\n` +
+    `Price: $${indicators.price?.toFixed(2) || "N/A"} | ` +
+    `RSI: ${indicators.rsi?.toFixed(1) || "N/A"}`
+  );
+}
+
+async function notifyScanSummary(scanned, insiderPicks, readyToTrade, ranked) {
+  const top = (ranked || []).slice(0, 5).map(s =>
+    `  ${s.symbol}: ${s.passCount}/3 conditions, ${s.insiderData.buys} insider buys`
+  ).join("\n");
+
+  const readyList = readyToTrade > 0
+    ? `\n\n✅ ${readyToTrade} stocks ready to trade!`
+    : "\n\nNo stocks pass all conditions yet.";
+
+  await sendTelegram(
+    `📊 <b>SCAN COMPLETE</b>\n\n` +
+    `Stocks scanned: ${scanned}\n` +
+    `Insider buying: ${insiderPicks}\n` +
+    `Ready to trade: ${readyToTrade}` +
+    readyList +
+    (top ? `\n\n<b>Top watchlist:</b>\n${top}` : "")
+  );
+}
+
+async function notifyError(context, error) {
+  await sendTelegram(
+    `❌ <b>BOT ERROR</b>\n\n` +
+    `Context: ${context}\n` +
+    `Error: ${error}`
+  );
+}
+
+async function notifyStartup() {
+  const mode = CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE";
+  await sendTelegram(
+    `🤖 <b>Bot starting</b>\n\n` +
+    `Mode: ${mode}\n` +
+    `Time: ${new Date().toLocaleString("en-US", { timeZone: "America/New_York" })} ET\n` +
+    `Strategy: V5 Heavy Insiders`
+  );
+}
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -840,6 +925,7 @@ async function evaluateAndTrade(symbol, log) {
     console.log(`🚫 TRADE BLOCKED — ${symbol}`);
     console.log(`   Failed conditions:`);
     failed.forEach((f) => console.log(`   - ${f}`));
+    await notifyBlocked(symbol, failed, { price, rsi });
   } else {
     const side = bias === "BEARISH" ? "sell" : "buy";
     console.log(`✅ ALL CONDITIONS MET — ${symbol} ${bias}`);
@@ -851,6 +937,7 @@ async function evaluateAndTrade(symbol, log) {
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
+      await notifyTradeExecuted(symbol, side, price, tradeSize, logEntry.orderId, bias);
     } else {
       console.log(
         `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side.toUpperCase()} ${symbol}`,
@@ -860,9 +947,11 @@ async function evaluateAndTrade(symbol, log) {
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         console.log(`✅ ORDER PLACED — ${order.orderId}`);
+        await notifyTradeExecuted(symbol, side, price, tradeSize, order.orderId, bias);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
+        await notifyError("Order placement", `${symbol}: ${err.message}`);
       }
     }
   }
@@ -896,6 +985,8 @@ async function run() {
   );
   console.log("═══════════════════════════════════════════════════════════");
 
+  await notifyStartup();
+
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Timeframe: ${CONFIG.timeframe}`);
@@ -905,6 +996,7 @@ async function run() {
   const withinLimits = checkTradeLimits(log);
   if (!withinLimits) {
     console.log("\nBot stopping — trade limits reached for today.");
+    await sendTelegram("⚠️ <b>Daily trade limit reached</b> — bot is done for today.");
     return;
   }
 
@@ -924,6 +1016,7 @@ async function run() {
     const ranked = await runScreener();
     if (!ranked || ranked.length === 0) {
       console.log("\nNo candidates found. No trades today.");
+      await notifyScanSummary(518, 0, 0, []);
       console.log("═══════════════════════════════════════════════════════════\n");
       return;
     }
@@ -931,6 +1024,9 @@ async function run() {
     // Trade the top candidates that pass all conditions (up to daily limit)
     const readyToTrade = ranked.filter((s) => s.allPass);
     const tradesRemaining = CONFIG.maxTradesPerDay - countTodaysTrades(log);
+
+    // Send scan summary to Telegram
+    await notifyScanSummary(518, ranked.length, readyToTrade.length, ranked);
 
     if (readyToTrade.length === 0) {
       console.log("\n── No stocks pass all conditions today ──────────────────");
@@ -965,8 +1061,9 @@ async function run() {
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
 } else {
-  run().catch((err) => {
+  run().catch(async (err) => {
     console.error("Bot error:", err);
+    await notifyError("Bot crash", err.message);
     process.exit(1);
   });
 }
