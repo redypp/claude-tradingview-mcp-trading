@@ -1,0 +1,33 @@
+{
+  "strategy": {
+    "name": "dual-momentum",
+    "full_name": "Dual Momentum (Antonacci)",
+    "version": "1.0",
+    "status": "PAPER — pending backtest validation and 3-month paper period",
+    "description": "Monthly rotation between SPY/EFA based on 12-month total return, with AGG as safety position when both risk assets are below cash (BIL).",
+    "source": "Gary Antonacci, 'Dual Momentum Investing', 2014"
+  },
+
+  "broker": {
+    "type": "alpaca",
+    "account_env_prefix": "ALPACA_DM"
+  },
+
+  "risk_assets": ["SPY", "EFA"],
+  "cash_proxy": "BIL",
+  "safety_asset": "AGG",
+
+  "lookback_days": 252,
+  "allocation_pct": 0.98,
+
+  "rebalance": {
+    "cadence": "monthly",
+    "day": "first_trading_day"
+  },
+
+  "why_this_works": {
+    "edge": "Cross-sectional momentum (relative strength) is one of the most robust factor anomalies in the literature, documented since Jegadeesh & Titman 1993. Absolute momentum (trend following) protects against drawdowns.",
+    "not_overfit": "Only 3 parameters: lookback period (252d), safety asset (AGG), cadence (monthly). No per-stock tuning.",
+    "risk_management": "Flight to safety (AGG or BIL) when both equity regions are below cash prevents deep drawdowns in bear markets."
+  }
+}

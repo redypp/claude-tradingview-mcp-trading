@@ -88,6 +88,28 @@ const STRATEGIES = {
     tpRsi: 70,
   },
 
+  "V5a: Insiders >=3": {
+    description: "3+ insider buys — lower bar to recover sample size post Form 4 fix",
+    entry: (d) => d.ema10 > d.ema21 && d.above200 && d.rsi > 35 && d.rsi < 70 && d.insiders >= 3,
+    stopAtr: 1.5,
+    quickExit: true,
+    quickExitDays: 5,
+    trailingStop: false,
+    trailingAtr: 1.5,
+    tpRsi: 70,
+  },
+
+  "V5b: Insiders >=2": {
+    description: "2+ insider buys — lowest meaningful threshold",
+    entry: (d) => d.ema10 > d.ema21 && d.above200 && d.rsi > 35 && d.rsi < 70 && d.insiders >= 2,
+    stopAtr: 1.5,
+    quickExit: true,
+    quickExitDays: 5,
+    trailingStop: false,
+    trailingAtr: 1.5,
+    tpRsi: 70,
+  },
+
   "V6: BEST COMBO": {
     description: "Simplified trend + drop RVOL + quick exit losers at 5d + pullback entry (RSI 40-55)",
     entry: (d) => d.ema10 > d.ema21 && d.above200 && d.rsi > 40 && d.rsi < 55 && d.closePos > 50 && d.insiders >= 1,
@@ -158,10 +180,12 @@ async function fetchInsiders(symbol) {
   const res = await fetch(`https://finnhub.io/api/v1/stock/insider-transactions?symbol=${symbol}&token=${FINNHUB_KEY}`);
   if (!res.ok) return [];
   const data = await res.json();
-  return (data.data||[]).filter(t => t.transactionCode==="P" || t.transactionCode==="A");
+  // SEC Form 4: P = open-market purchase only. A (grant/award) is
+  // compensation, not conviction — excluding it.
+  return (data.data||[]).filter(t => t.transactionCode==="P");
 }
 async function fetchCandles(symbol) {
-  const params = new URLSearchParams({timeframe:"1Day",start:"2023-06-01",end:"2026-04-09",limit:"10000",feed:"iex",adjustment:"raw"});
+  const params = new URLSearchParams({timeframe:"1Day",start:"2021-01-01",end:"2026-04-09",limit:"10000",feed:"iex",adjustment:"raw"});
   const res = await fetch(`https://data.alpaca.markets/v2/stocks/${symbol}/bars?${params}`, {
     headers: {"APCA-API-KEY-ID":ALPACA_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET},
   });
@@ -322,17 +346,9 @@ async function main() {
   console.log("  Testing 7 fundamentally different approaches");
   console.log("════════════════════════════════════════════════════════════\n");
 
-  // Expanded universe — 75 stocks for more data
-  const symbols = [
-    "AAPL","MSFT","AMZN","NVDA","GOOGL","META","TSLA","BRK.B","UNH","LLY",
-    "JPM","V","XOM","JNJ","MA","PG","AVGO","HD","CVX","MRK",
-    "ABBV","KO","PEP","COST","PFE","BAC","TMO","MCD","CSCO","ACN",
-    "ABT","CRM","NFLX","AMD","LIN","DHR","ORCL","TXN","ADBE","WMT",
-    "NKE","PM","NEE","UNP","RTX","LOW","INTC","QCOM","INTU","AMGN",
-    "CAT","GS","DE","BLK","SYK","ISRG","MDLZ","ADP","REGN","VRTX",
-    "MMC","CI","CB","SO","CME","ICE","AON","PLD","BSX","HUM",
-    "PANW","SNPS","CDNS","KLAC","AMAT",
-  ];
+  // Load full S&P 500 universe from universe.json
+  const universe = JSON.parse(readFileSync("universe.json", "utf8"));
+  const symbols = universe.symbols;
 
   console.log(`Loading data for ${symbols.length} stocks...\n`);
 

@@ -77,7 +77,8 @@ async function fetchInsiders(symbol) {
   const res = await fetch(`https://finnhub.io/api/v1/stock/insider-transactions?symbol=${symbol}&token=${FINNHUB_KEY}`);
   if (!res.ok) return [];
   const data = await res.json();
-  return (data.data || []).filter(t => t.transactionCode === "P" || t.transactionCode === "A");
+  // SEC Form 4: P = open-market purchase only. A is grant/award.
+  return (data.data || []).filter(t => t.transactionCode === "P");
 }
 
 async function fetchCandles(symbol) {

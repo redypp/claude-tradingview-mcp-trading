@@ -166,9 +166,8 @@ async function fetchInsiderHistory(symbol) {
   const res = await fetch(url);
   if (!res.ok) return [];
   const data = await res.json();
-  return (data.data || []).filter(
-    (t) => t.transactionCode === "P" || t.transactionCode === "A",
-  );
+  // SEC Form 4: P = open-market purchase only. A is grant/award.
+  return (data.data || []).filter((t) => t.transactionCode === "P");
 }
 
 async function fetchHistoricalCandles(symbol) {
