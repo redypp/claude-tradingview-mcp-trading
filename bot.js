@@ -179,6 +179,17 @@ async function notifyError(context, error) {
   );
 }
 
+async function notifyPositionClosed(symbol, reason, entryPrice, exitPrice, pnlPct, daysHeld) {
+  const icon = pnlPct >= 0 ? "💰" : "📉";
+  await sendTelegram(
+    `${icon} <b>POSITION CLOSED</b> — ${symbol}\n\n` +
+    `Reason: ${reason}\n` +
+    `Entry: $${entryPrice.toFixed(2)} → Exit: $${exitPrice.toFixed(2)}\n` +
+    `P&L: ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%\n` +
+    `Held: ${daysHeld} trading day${daysHeld === 1 ? "" : "s"}`
+  );
+}
+
 async function notifyStartup() {
   const mode = CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE";
   await sendTelegram(
@@ -272,6 +283,7 @@ async function fetchCandles(symbol, interval, limit = 100) {
 // ─── Indicator Calculations ──────────────────────────────────────────────────
 
 function calcEMA(closes, period) {
+  if (closes.length < period) return null;
   const multiplier = 2 / (period + 1);
   let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
   for (let i = period; i < closes.length; i++) {
@@ -288,15 +300,25 @@ function calcSMA(closes, period) {
 
 function calcRSI(closes, period = 14) {
   if (closes.length < period + 1) return null;
-  let gains = 0,
-    losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
+  // Wilder's RSI: seed with simple average of first `period` diffs,
+  // then exponentially smooth across all remaining bars. Matches
+  // TradingView's built-in RSI.
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i <= period; i++) {
     const diff = closes[i] - closes[i - 1];
     if (diff > 0) gains += diff;
     else losses -= diff;
   }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
   return 100 - 100 / (1 + rs);
@@ -360,13 +382,11 @@ async function fetchInsiderTransactions(symbol) {
     (t) => t.transactionDate >= cutoffStr,
   );
 
-  // Count buys vs sells (acquisition = buy, disposition = sell)
-  const buys = recent.filter(
-    (t) => t.transactionCode === "P" || t.transactionCode === "A",
-  );
-  const sells = recent.filter(
-    (t) => t.transactionCode === "S" || t.transactionCode === "D",
-  );
+  // SEC Form 4 codes: P = open-market purchase, S = open-market sale.
+  // A (grant/award) and D (disposition to issuer) are compensation/tax
+  // events, not conviction signals — exclude them.
+  const buys = recent.filter((t) => t.transactionCode === "P");
+  const sells = recent.filter((t) => t.transactionCode === "S");
 
   const buyShares = buys.reduce((sum, t) => sum + Math.abs(t.share || 0), 0);
   const sellShares = sells.reduce((sum, t) => sum + Math.abs(t.share || 0), 0);
@@ -570,64 +590,44 @@ function runSafetyCheck(indicators, insiderData) {
 
   const { price, ema10, ema21, sma50, sma200, rsi, atr, rvol, closePos } = indicators;
 
-  // V5: Simplified trend — just EMA10 > EMA21 + above SMA200
   const trendUp = ema10 > ema21;
   const aboveSMA200 = price > sma200;
 
-  if (trendUp && aboveSMA200) {
-    console.log("  Bias: BULLISH — checking entry conditions\n");
+  check(
+    "EMA(10) > EMA(21) (short-term trend up)",
+    "EMA10 > EMA21",
+    `EMA10: ${ema10.toFixed(2)} | EMA21: ${ema21.toFixed(2)}`,
+    trendUp,
+  );
 
-    // 1. EMA10 > EMA21 (short-term uptrend)
+  check(
+    "Price above SMA 200 (long-term uptrend)",
+    `> ${sma200.toFixed(2)}`,
+    price.toFixed(2),
+    aboveSMA200,
+  );
+
+  check(
+    "RSI(14) between 35-70 (not overbought)",
+    "35 < RSI < 70",
+    rsi !== null ? rsi.toFixed(2) : "N/A",
+    rsi !== null && rsi > 35 && rsi < 70,
+  );
+
+  if (insiderData.available) {
     check(
-      "EMA(10) > EMA(21) (short-term trend up)",
-      `EMA10 > EMA21`,
-      `EMA10: ${ema10.toFixed(2)} | EMA21: ${ema21.toFixed(2)}`,
-      trendUp,
+      "Heavy insider buying (5+ purchases in 90 days)",
+      ">= 5 insider buys, net buying",
+      `${insiderData.buys} buys, ${insiderData.sells} sells (net: ${insiderData.netBuying ? "BUYING" : "SELLING"})`,
+      insiderData.buys >= 5 && insiderData.netBuying,
     );
-
-    // 2. Price above SMA 200
-    check(
-      "Price above SMA 200 (long-term uptrend)",
-      `> ${sma200.toFixed(2)}`,
-      price.toFixed(2),
-      aboveSMA200,
-    );
-
-    // 3. RSI between 35-70 (wider range than before)
-    check(
-      "RSI(14) between 35-70 (not overbought)",
-      "35 < RSI < 70",
-      rsi ? rsi.toFixed(2) : "N/A",
-      rsi !== null && rsi > 35 && rsi < 70,
-    );
-
-    // 4. Heavy insider buying (5+ buys in 90 days)
-    if (insiderData.available) {
-      check(
-        "Heavy insider buying (5+ purchases in 90 days)",
-        ">= 5 insider buys, net buying",
-        `${insiderData.buys} buys, ${insiderData.sells} sells (net: ${insiderData.netBuying ? "BUYING" : "SELLING"})`,
-        insiderData.buys >= 5 && insiderData.netBuying,
-      );
-    } else {
-      check(
-        "Heavy insider buying (5+ purchases in 90 days)",
-        "Data available",
-        insiderData.reason,
-        false,
-      );
-    }
-
   } else {
-    console.log("  Bias: NO ENTRY — trend conditions not met.\n");
-    console.log(`     EMA10: ${ema10.toFixed(2)} | EMA21: ${ema21.toFixed(2)} | SMA200: ${sma200.toFixed(2)}`);
-    console.log(`     Price: ${price.toFixed(2)} | EMA10>EMA21: ${trendUp ? "YES" : "NO"} | Above SMA200: ${aboveSMA200 ? "YES" : "NO"}`);
-    results.push({
-      label: "Trend direction",
-      required: "EMA10 > EMA21 and price > SMA200",
-      actual: `EMA10${trendUp ? ">" : "<"}EMA21, price ${aboveSMA200 ? "above" : "below"} SMA200`,
-      pass: false,
-    });
+    check(
+      "Heavy insider buying (5+ purchases in 90 days)",
+      "Data available",
+      insiderData.reason,
+      false,
+    );
   }
 
   const allPass = results.every((r) => r.pass);
@@ -697,6 +697,38 @@ async function placeAlpacaOrder(symbol, side, sizeUSD, price) {
     throw new Error(`Alpaca order failed: ${data.message || JSON.stringify(data)}`);
   }
 
+  return { orderId: data.id, status: data.status };
+}
+
+async function fetchAlpacaPositions() {
+  const res = await fetch(`${CONFIG.alpaca.baseUrl}/v2/positions`, {
+    headers: {
+      "APCA-API-KEY-ID": CONFIG.alpaca.apiKey,
+      "APCA-API-SECRET-KEY": CONFIG.alpaca.secretKey,
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`Alpaca positions fetch failed: ${res.status} ${await res.text()}`);
+  }
+  return await res.json();
+}
+
+async function closeAlpacaPosition(symbol) {
+  // DELETE /v2/positions/{symbol} closes the entire position at market.
+  const res = await fetch(
+    `${CONFIG.alpaca.baseUrl}/v2/positions/${encodeURIComponent(symbol)}`,
+    {
+      method: "DELETE",
+      headers: {
+        "APCA-API-KEY-ID": CONFIG.alpaca.apiKey,
+        "APCA-API-SECRET-KEY": CONFIG.alpaca.secretKey,
+      },
+    },
+  );
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Alpaca position close failed: ${data.message || JSON.stringify(data)}`);
+  }
   return { orderId: data.id, status: data.status };
 }
 
@@ -824,7 +856,7 @@ function generateTaxSummary() {
 
 // ─── Execute Trade on a Single Symbol ───────────────────────────────────────
 
-async function evaluateAndTrade(symbol, log) {
+async function evaluateAndTrade(symbol, log, preloadedInsiderData = null) {
   console.log(`\n══ Evaluating ${symbol} ══════════════════════════════════════\n`);
 
   // Fetch candle data
@@ -863,9 +895,9 @@ async function evaluateAndTrade(symbol, log) {
     return null;
   }
 
-  // Fetch insider data
+  // Fetch insider data (reuse from screener when available)
   console.log("\n── Checking Insider Activity (SEC Form 4) ──────────────\n");
-  const insiderData = await fetchInsiderTransactions(symbol);
+  const insiderData = preloadedInsiderData || await fetchInsiderTransactions(symbol);
 
   if (insiderData.available) {
     console.log(`  Transactions (90 days): ${insiderData.totalTransactions}`);
@@ -886,11 +918,19 @@ async function evaluateAndTrade(symbol, log) {
   const indicators = { price, ema10, ema21, sma50, sma200, rsi, atr, rvol, closePos };
   const { results, allPass, bias } = runSafetyCheck(indicators, insiderData);
 
-  // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
+  // Position size — risk 1% of portfolio on the ATR-based stop distance,
+  // capped at maxTradeSizeUSD. rules.json says "Risk max 1% per trade",
+  // which is (shares × stopDistance), not (shares × price).
+  const riskDollars = CONFIG.portfolioValue * 0.01;
+  const stopDistance = atr ? 1.5 * atr : null;
+  let tradeSize;
+  if (stopDistance && stopDistance > 0) {
+    const riskBasedNotional = (riskDollars / stopDistance) * price;
+    tradeSize = Math.min(riskBasedNotional, CONFIG.maxTradeSizeUSD);
+  } else {
+    // ATR unavailable — fall back to flat 1% allocation.
+    tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
+  }
 
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
@@ -937,6 +977,12 @@ async function evaluateAndTrade(symbol, log) {
       const order = await placeAlpacaOrder(symbol, side, tradeSize, price);
       logEntry.orderPlaced = true;
       logEntry.orderId = order.orderId;
+      // Entry context for the exit engine — ATR at entry is frozen
+      // so the 1.5x ATR stop distance doesn't drift as ATR changes.
+      logEntry.entryPrice = price;
+      logEntry.entryDate = new Date().toISOString().slice(0, 10);
+      logEntry.entryATR = atr;
+      logEntry.entrySide = side;
       console.log(`✅ ORDER SUBMITTED — ${order.orderId} (status: ${order.status})`);
       await notifyTradeExecuted(symbol, side, price, tradeSize, order.orderId, bias);
     } catch (err) {
@@ -962,6 +1008,174 @@ async function evaluateAndTrade(symbol, log) {
   return logEntry;
 }
 
+// ─── Exit Engine (Position Management) ──────────────────────────────────────
+
+function countTradingDaysBetween(startISO, endISO) {
+  // Inclusive of neither endpoint's weekend-ness, exclusive of end date itself.
+  // Holidays are not tracked — acceptable slippage for 5/30-day rules.
+  const start = new Date(startISO + "T00:00:00Z");
+  const end = new Date(endISO + "T00:00:00Z");
+  let count = 0;
+  const cursor = new Date(start);
+  cursor.setUTCDate(cursor.getUTCDate() + 1);
+  while (cursor <= end) {
+    const dow = cursor.getUTCDay();
+    if (dow !== 0 && dow !== 6) count++;
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return count;
+}
+
+function findEntryContextFromLog(log, symbol) {
+  // Return the most recent successful order log entry for this symbol.
+  const matches = log.trades.filter(
+    (t) => t.symbol === symbol && t.orderPlaced && t.entryDate,
+  );
+  return matches.length > 0 ? matches[matches.length - 1] : null;
+}
+
+async function evaluateExitRules(position, entryCtx) {
+  const symbol = position.symbol;
+  const qty = parseFloat(position.qty);
+  const entryPrice = entryCtx?.entryPrice ?? parseFloat(position.avg_entry_price);
+  const entryDate = entryCtx?.entryDate ?? new Date(position.created_at || Date.now()).toISOString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10);
+  const daysHeld = countTradingDaysBetween(entryDate, today);
+
+  // Fetch fresh daily candles for indicator evaluation
+  const candles = await fetchCandles(symbol, "1D", 250);
+  if (!candles || candles.length < 22) {
+    return { triggered: false, reason: null, note: `insufficient candles (${candles?.length ?? 0})` };
+  }
+
+  const closes = candles.map((c) => c.close);
+  const currentPrice = closes[closes.length - 1];
+  const ema10 = calcEMA(closes, 10);
+  const ema21 = calcEMA(closes, 21);
+  const rsi = calcRSI(closes, 14);
+  const currentAtr = calcATR(candles, 14);
+  const entryATR = entryCtx?.entryATR ?? currentAtr;
+
+  const pnlPct = ((currentPrice - entryPrice) / entryPrice) * 100;
+
+  // Rule 1 (hardest): ATR stop — 1.5x entry-ATR below entry
+  if (entryATR && currentPrice <= entryPrice - 1.5 * entryATR) {
+    return { triggered: true, reason: "ATR hard stop (-1.5x ATR)", pnlPct, daysHeld, currentPrice, entryPrice };
+  }
+
+  // Rule 2: 30-day time stop
+  if (daysHeld >= 30) {
+    return { triggered: true, reason: "30-day time stop", pnlPct, daysHeld, currentPrice, entryPrice };
+  }
+
+  // Rule 3: 5-day loser cut — if negative after 5 trading days, exit
+  if (daysHeld >= 5 && pnlPct < 0) {
+    return { triggered: true, reason: "5-day loser cut", pnlPct, daysHeld, currentPrice, entryPrice };
+  }
+
+  // Rule 4: RSI crosses above 70 — momentum exhaustion take-profit
+  if (rsi !== null && rsi > 70) {
+    return { triggered: true, reason: `RSI take-profit (${rsi.toFixed(1)} > 70)`, pnlPct, daysHeld, currentPrice, entryPrice };
+  }
+
+  // Rule 5: EMA10 crosses below EMA21 — trend break
+  if (ema10 !== null && ema21 !== null && ema10 < ema21) {
+    return { triggered: true, reason: "EMA trend break (EMA10 < EMA21)", pnlPct, daysHeld, currentPrice, entryPrice };
+  }
+
+  return {
+    triggered: false,
+    reason: null,
+    note: `held ${daysHeld}d | P&L ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}% | RSI ${rsi?.toFixed(1) ?? "N/A"} | EMA10${ema10 > ema21 ? ">" : "<"}EMA21`,
+    pnlPct,
+    daysHeld,
+    currentPrice,
+    entryPrice,
+  };
+}
+
+async function managePositions(log) {
+  console.log("\n══ Managing Open Positions ══════════════════════════════════\n");
+
+  let positions;
+  try {
+    positions = await fetchAlpacaPositions();
+  } catch (err) {
+    console.log(`  ❌ Failed to fetch positions: ${err.message}`);
+    await notifyError("Fetch positions", err.message);
+    return;
+  }
+
+  if (!positions || positions.length === 0) {
+    console.log("  No open positions to manage.\n");
+    return;
+  }
+
+  console.log(`  Found ${positions.length} open position${positions.length === 1 ? "" : "s"}.\n`);
+
+  for (const position of positions) {
+    const symbol = position.symbol;
+    const entryCtx = findEntryContextFromLog(log, symbol);
+
+    console.log(`── ${symbol} ──`);
+    if (entryCtx) {
+      console.log(`  Entry context from log: ${entryCtx.entryDate} @ $${entryCtx.entryPrice?.toFixed(2)} (ATR $${entryCtx.entryATR?.toFixed(2) ?? "N/A"})`);
+    } else {
+      console.log(`  ⚠️  No log entry found — falling back to Alpaca avg_entry_price and created_at`);
+    }
+
+    let evalResult;
+    try {
+      evalResult = await evaluateExitRules(position, entryCtx);
+    } catch (err) {
+      console.log(`  ❌ Exit evaluation error: ${err.message}`);
+      await notifyError(`Exit eval ${symbol}`, err.message);
+      continue;
+    }
+
+    if (!evalResult.triggered) {
+      console.log(`  ✅ HOLD — ${evalResult.note || "no exit rule triggered"}\n`);
+      continue;
+    }
+
+    console.log(`  🚨 EXIT — ${evalResult.reason}`);
+    console.log(`     Entry $${evalResult.entryPrice.toFixed(2)} → Current $${evalResult.currentPrice.toFixed(2)} | ${evalResult.pnlPct >= 0 ? "+" : ""}${evalResult.pnlPct.toFixed(2)}% | ${evalResult.daysHeld}d held`);
+
+    try {
+      const closeResult = await closeAlpacaPosition(symbol);
+      console.log(`     ✅ Close order submitted — ${closeResult.orderId} (${closeResult.status})`);
+      await notifyPositionClosed(
+        symbol,
+        evalResult.reason,
+        evalResult.entryPrice,
+        evalResult.currentPrice,
+        evalResult.pnlPct,
+        evalResult.daysHeld,
+      );
+
+      // Record the exit on the log for auditability
+      log.trades.push({
+        timestamp: new Date().toISOString(),
+        symbol,
+        type: "EXIT",
+        reason: evalResult.reason,
+        entryPrice: evalResult.entryPrice,
+        exitPrice: evalResult.currentPrice,
+        pnlPct: evalResult.pnlPct,
+        daysHeld: evalResult.daysHeld,
+        closeOrderId: closeResult.orderId,
+      });
+    } catch (err) {
+      console.log(`     ❌ Close failed: ${err.message}`);
+      await notifyError(`Close ${symbol}`, err.message);
+    }
+    console.log("");
+  }
+
+  saveLog(log);
+  console.log("══ Position management complete ═════════════════════════════\n");
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function run() {
@@ -981,12 +1195,19 @@ async function run() {
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Timeframe: ${CONFIG.timeframe}`);
 
-  // Load log and check daily limits
+  // Load log
   const log = loadLog();
+
+  // Exit management runs FIRST on every invocation — exits aren't bound
+  // by the daily trade limit and catching an overnight gap-down at open
+  // matters more than waiting for the post-close run.
+  await managePositions(log);
+
+  // Entry trade limit check
   const withinLimits = checkTradeLimits(log);
   if (!withinLimits) {
-    console.log("\nBot stopping — trade limits reached for today.");
-    await sendTelegram("⚠️ <b>Daily trade limit reached</b> — bot is done for today.");
+    console.log("\nSkipping entry scan — daily trade limit reached.");
+    await sendTelegram("⚠️ <b>Daily trade limit reached</b> — no new entries today.");
     return;
   }
 
@@ -1003,10 +1224,13 @@ async function run() {
     // Screener mode: scan universe for best trades
     console.log(`\nMode: Screener — scanning S&P 500 for institutional accumulation`);
 
+    const universe = await loadUniverse();
+    const universeSize = universe ? universe.length : 0;
+
     const ranked = await runScreener();
     if (!ranked || ranked.length === 0) {
       console.log("\nNo candidates found. No trades today.");
-      await notifyScanSummary(518, 0, 0, []);
+      await notifyScanSummary(universeSize, 0, 0, []);
       console.log("═══════════════════════════════════════════════════════════\n");
       return;
     }
@@ -1016,7 +1240,7 @@ async function run() {
     const tradesRemaining = CONFIG.maxTradesPerDay - countTodaysTrades(log);
 
     // Send scan summary to Telegram
-    await notifyScanSummary(518, ranked.length, readyToTrade.length, ranked);
+    await notifyScanSummary(universeSize, ranked.length, readyToTrade.length, ranked);
 
     if (readyToTrade.length === 0) {
       console.log("\n── No stocks pass all conditions today ──────────────────");
@@ -1033,7 +1257,7 @@ async function run() {
           console.log("  Daily trade limit reached — stopping.");
           break;
         }
-        await evaluateAndTrade(candidate.symbol, log);
+        await evaluateAndTrade(candidate.symbol, log, candidate.insiderData);
       }
     }
 
@@ -1050,6 +1274,16 @@ async function run() {
 
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
+} else if (process.argv.includes("--manage-positions")) {
+  // Exit-only mode: manage open positions, don't scan for entries.
+  (async () => {
+    const log = loadLog();
+    await managePositions(log);
+  })().catch(async (err) => {
+    console.error("Position manager error:", err);
+    await notifyError("Position manager crash", err.message);
+    process.exit(1);
+  });
 } else {
   run().catch(async (err) => {
     console.error("Bot error:", err);
