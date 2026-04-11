@@ -4,3 +4,4 @@ safety-check-log.json
 node_modules/
 backtest*results.json
 backtest-comparison.json
+trades.csv
