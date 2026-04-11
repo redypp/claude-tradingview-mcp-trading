@@ -928,31 +928,21 @@ async function evaluateAndTrade(symbol, log) {
     await notifyBlocked(symbol, failed, { price, rsi });
   } else {
     const side = bias === "BEARISH" ? "sell" : "buy";
+    const modeLabel = CONFIG.paperTrading ? "📋 PAPER" : "🔴 LIVE";
     console.log(`✅ ALL CONDITIONS MET — ${symbol} ${bias}`);
-
-    if (CONFIG.paperTrading) {
-      console.log(
-        `\n📋 PAPER TRADE — would ${side} ${symbol} ~$${tradeSize.toFixed(2)} at market`,
-      );
-      console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
+    console.log(
+      `\n${modeLabel} — submitting ${side.toUpperCase()} ${symbol} ~$${tradeSize.toFixed(2)} at market`,
+    );
+    try {
+      const order = await placeAlpacaOrder(symbol, side, tradeSize, price);
       logEntry.orderPlaced = true;
-      logEntry.orderId = `PAPER-${Date.now()}`;
-      await notifyTradeExecuted(symbol, side, price, tradeSize, logEntry.orderId, bias);
-    } else {
-      console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${side.toUpperCase()} ${symbol}`,
-      );
-      try {
-        const order = await placeAlpacaOrder(symbol, side, tradeSize, price);
-        logEntry.orderPlaced = true;
-        logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
-        await notifyTradeExecuted(symbol, side, price, tradeSize, order.orderId, bias);
-      } catch (err) {
-        console.log(`❌ ORDER FAILED — ${err.message}`);
-        logEntry.error = err.message;
-        await notifyError("Order placement", `${symbol}: ${err.message}`);
-      }
+      logEntry.orderId = order.orderId;
+      console.log(`✅ ORDER SUBMITTED — ${order.orderId} (status: ${order.status})`);
+      await notifyTradeExecuted(symbol, side, price, tradeSize, order.orderId, bias);
+    } catch (err) {
+      console.log(`❌ ORDER FAILED — ${err.message}`);
+      logEntry.error = err.message;
+      await notifyError("Order placement", `${symbol}: ${err.message}`);
     }
   }
 
