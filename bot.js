@@ -1,44 +1,34 @@
 /**
- * Multi-strategy trading bot dispatcher.
+ * Multi-strategy trading bot — governance-first dispatcher.
  *
- * Loads one or more strategy modules from strategies/, instantiates
- * a broker client per strategy using that strategy's configured
- * credentials, and runs each strategy in sequence.
+ * Loads strategy mandates from mandates/, enforces portfolio-level
+ * risk limits and kill switches, and tracks per-strategy attribution.
  *
  * Usage:
- *   node bot.js                              # runs all enabled strategies
- *   node bot.js --strategies=dual-momentum   # runs only the named strategies
- *   node bot.js --manage-positions           # only runs exit management
- *   node bot.js --list                       # lists available strategies
+ *   node bot.js                              # runs all active strategies
+ *   node bot.js --strategies=name1,name2     # runs only the named strategies
+ *   node bot.js --manage-positions           # exit management only
+ *   node bot.js --list                       # lists mandates + status
+ *   node bot.js --stats                      # prints attribution stats
  */
 
 import "dotenv/config";
-import { readFileSync, readdirSync, existsSync } from "fs";
-import { join } from "path";
+import { existsSync } from "fs";
 import { createAlpacaClient } from "./brokers/alpaca.js";
 import { createNotifier } from "./engine/telegram.js";
 import { managePositions } from "./engine/exit-engine.js";
 import { loadLog, saveLog } from "./engine/logging.js";
+import { listMandates, loadMandate, isActive } from "./portfolio/mandate.js";
+import {
+  loadPortfolioState,
+  savePortfolioState,
+  initStrategyState,
+} from "./portfolio/state.js";
+import { wrapBroker } from "./portfolio/risk-manager.js";
+import { computeStats, compareToMandate } from "./portfolio/attribution.js";
 
-const RULES_DIR = "rules";
-
-function listStrategies() {
-  if (!existsSync(RULES_DIR)) return [];
-  return readdirSync(RULES_DIR)
-    .filter((f) => f.endsWith(".json"))
-    .map((f) => f.replace(/\.json$/, ""));
-}
-
-function loadRules(strategyName) {
-  const path = join(RULES_DIR, `${strategyName}.json`);
-  if (!existsSync(path)) {
-    throw new Error(`No rules file for strategy "${strategyName}" at ${path}`);
-  }
-  return JSON.parse(readFileSync(path, "utf8"));
-}
-
-function createBrokerForStrategy(rules) {
-  const brokerConfig = rules.broker || {};
+function createBrokerFromMandate(mandate) {
+  const brokerConfig = mandate.broker || {};
   const prefix = brokerConfig.account_env_prefix || "ALPACA";
 
   if (brokerConfig.type === "alpaca" || !brokerConfig.type) {
@@ -46,7 +36,7 @@ function createBrokerForStrategy(rules) {
     const secretKey = process.env[`${prefix}_SECRET_KEY`];
     if (!apiKey || !secretKey) {
       throw new Error(
-        `Missing credentials for strategy — expected ${prefix}_API_KEY and ${prefix}_SECRET_KEY in .env`,
+        `Missing credentials — expected ${prefix}_API_KEY and ${prefix}_SECRET_KEY in .env`,
       );
     }
     return createAlpacaClient({
@@ -60,8 +50,8 @@ function createBrokerForStrategy(rules) {
   throw new Error(`Unsupported broker type: ${brokerConfig.type}`);
 }
 
-async function loadStrategyModule(strategyName) {
-  const path = `./strategies/${strategyName}.js`;
+async function loadStrategyModule(name) {
+  const path = `./strategies/${name}.js`;
   if (!existsSync(path)) {
     throw new Error(`Strategy module not found: ${path}`);
   }
@@ -69,82 +59,200 @@ async function loadStrategyModule(strategyName) {
   return mod.default;
 }
 
-async function runStrategy(strategyName, { manageOnly = false } = {}) {
+function wrapDryRun(broker) {
+  return {
+    ...broker,
+    async placeOrder(args) {
+      console.log(`  🧪 [dry-run] placeOrder(${JSON.stringify(args)})`);
+      return { orderId: `dry-${Date.now()}`, status: "dry-run", symbol: args.symbol };
+    },
+    async closePosition(symbol) {
+      console.log(`  🧪 [dry-run] closePosition(${symbol})`);
+      return { orderId: `dry-close-${Date.now()}`, status: "dry-run" };
+    },
+  };
+}
+
+async function runStrategy(name, { manageOnly = false, forceRebalance = false, dryRun = false } = {}) {
   console.log(`\n═══════════════════════════════════════════════════════════`);
-  console.log(`  Strategy: ${strategyName}`);
+  console.log(`  Strategy: ${name}`);
   console.log(`  ${new Date().toISOString()}`);
   console.log(`═══════════════════════════════════════════════════════════`);
 
-  let rules, broker, strategy;
+  let mandate;
   try {
-    rules = loadRules(strategyName);
-    broker = createBrokerForStrategy(rules);
-    strategy = await loadStrategyModule(strategyName);
+    mandate = loadMandate(name);
   } catch (err) {
-    console.log(`  ❌ Failed to initialize: ${err.message}`);
+    console.log(`  ❌ Mandate load failed: ${err.message}`);
     return;
   }
 
-  const notify = createNotifier(strategy.name || strategyName);
-  const state = {};
+  if (!isActive(mandate)) {
+    console.log(`  ⏸  Skipped — status=${mandate.status}${mandate.killReason ? ` (${mandate.killReason})` : ""}`);
+    return;
+  }
 
-  // Every invocation: manage existing positions first (if strategy exposes shouldExit)
+  const portfolioState = loadPortfolioState();
+  const strategyState = initStrategyState(portfolioState, mandate);
+  savePortfolioState(portfolioState);
+
+  if (strategyState.killed) {
+    console.log(`  ⛔ Strategy killed — ${strategyState.killReason}`);
+    return;
+  }
+
+  let rawBroker, strategy;
+  try {
+    rawBroker = createBrokerFromMandate(mandate);
+    strategy = await loadStrategyModule(name);
+  } catch (err) {
+    console.log(`  ❌ Init failed: ${err.message}`);
+    return;
+  }
+
+  if (dryRun) {
+    console.log(`  🧪 DRY-RUN MODE — no real orders will be placed`);
+    rawBroker = wrapDryRun(rawBroker);
+  }
+
+  const notify = createNotifier(strategy.name || name);
+  const broker = wrapBroker({
+    broker: rawBroker,
+    mandate,
+    strategyState,
+    savePortfolioState,
+    portfolioState,
+    notify,
+  });
+
+  await broker.__governance.syncEquity();
+
+  const kill = await broker.__governance.checkKillSwitches();
+  if (kill.killed) {
+    console.log(`  ⛔ Kill switch — ${kill.reason}`);
+    return;
+  }
+
+  const rules = mandate.strategy || {};
+  const log = loadLog(name);
+  const state = { log };
+
   if (typeof strategy.shouldExit === "function") {
-    const log = loadLog(strategyName);
-    state.log = log;
     try {
-      await managePositions({ broker, strategy, log, notify });
-      saveLog(strategyName, log);
+      await managePositions({ broker, strategy, log, notify, rules });
     } catch (err) {
       console.log(`  ❌ Exit management error: ${err.message}`);
       await notify.error("Exit management", err.message);
     }
   }
 
-  if (manageOnly) return;
+  if (manageOnly) {
+    saveLog(name, log);
+    await broker.__governance.syncEquity();
+    return;
+  }
 
-  // Then run the strategy's main cycle
   if (typeof strategy.run === "function") {
     try {
-      await strategy.run({ broker, notify, rules, state });
+      if (forceRebalance) state.forceRebalance = true;
+      await strategy.run({ broker, notify, rules, mandate, state });
     } catch (err) {
       console.log(`  ❌ Strategy run error: ${err.message}`);
       console.error(err);
       await notify.error("Strategy run", err.message);
     }
   }
+
+  saveLog(name, log);
+
+  await broker.__governance.syncEquity();
+
+  const fresh = loadPortfolioState();
+  const freshState = fresh.strategies[name];
+  if (freshState) {
+    const stats = computeStats(freshState);
+    const flags = compareToMandate(stats, mandate);
+    console.log(
+      `  📊 Equity: $${stats.currentEquity.toFixed(2)} | DD: ${(stats.drawdownPct * 100).toFixed(1)}% | CAGR: ${(stats.cagr * 100).toFixed(1)}% | Sharpe: ${stats.sharpe.toFixed(2)} | Trades: ${stats.tradeCount}`,
+    );
+    if (flags.length) {
+      for (const f of flags) console.log(`  ⚠️  ${f}`);
+    }
+  }
+}
+
+function printList() {
+  const names = listMandates();
+  if (!names.length) {
+    console.log("No mandates found in mandates/.");
+    return;
+  }
+  console.log("Mandates:");
+  for (const n of names) {
+    try {
+      const m = loadMandate(n);
+      console.log(`  ${m.status === "killed" ? "⛔" : isActive(m) ? "✅" : "⏸ "} ${n}  [${m.status}]  ${m.displayName}`);
+    } catch (err) {
+      console.log(`  ❌ ${n}  — ${err.message}`);
+    }
+  }
+}
+
+function printStats() {
+  const portfolioState = loadPortfolioState();
+  const names = Object.keys(portfolioState.strategies);
+  if (!names.length) {
+    console.log("No portfolio state yet. Run the bot first.");
+    return;
+  }
+  console.log("Portfolio attribution:");
+  for (const n of names) {
+    const s = portfolioState.strategies[n];
+    let mandate = null;
+    try { mandate = loadMandate(n); } catch {}
+    const stats = computeStats(s);
+    console.log(`\n  ${n}`);
+    console.log(`    Equity:     $${stats.currentEquity.toFixed(2)} (peak $${stats.peakEquity.toFixed(2)})`);
+    console.log(`    Total ret:  ${(stats.totalReturnPct * 100).toFixed(2)}%`);
+    console.log(`    CAGR:       ${(stats.cagr * 100).toFixed(2)}%`);
+    console.log(`    Sharpe:     ${stats.sharpe.toFixed(2)}`);
+    console.log(`    Drawdown:   ${(stats.drawdownPct * 100).toFixed(2)}%`);
+    console.log(`    Trades:     ${stats.tradeCount}`);
+    console.log(`    Days live:  ${stats.daysLive}`);
+    if (s.killed) console.log(`    ⛔ Killed:  ${s.killReason}`);
+    if (mandate) {
+      const flags = compareToMandate(stats, mandate);
+      for (const f of flags) console.log(`    ⚠️  ${f}`);
+    }
+  }
 }
 
 async function main() {
-  if (process.argv.includes("--list")) {
-    const strategies = listStrategies();
-    console.log("Available strategies:");
-    for (const s of strategies) console.log(`  - ${s}`);
-    return;
-  }
+  if (process.argv.includes("--list")) return printList();
+  if (process.argv.includes("--stats")) return printStats();
 
-  // Resolve which strategies to run
-  const strategiesArg = process.argv.find((a) => a.startsWith("--strategies="));
-  let strategies;
-  if (strategiesArg) {
-    strategies = strategiesArg.split("=")[1].split(",").map((s) => s.trim()).filter(Boolean);
-  } else {
-    strategies = listStrategies();
-  }
+  const arg = process.argv.find((a) => a.startsWith("--strategies="));
+  const strategies = arg
+    ? arg.split("=")[1].split(",").map((s) => s.trim()).filter(Boolean)
+    : listMandates();
 
-  if (strategies.length === 0) {
-    console.log("No strategies found in rules/. Create rules/<strategy>.json first.");
+  if (!strategies.length) {
+    console.log("No mandates found in mandates/. Create one from mandates/TEMPLATE.json.");
     return;
   }
 
   const manageOnly = process.argv.includes("--manage-positions");
+  const forceRebalance = process.argv.includes("--force-rebalance");
+  const dryRun = process.argv.includes("--dry-run");
 
   console.log(`Running ${strategies.length} strateg${strategies.length === 1 ? "y" : "ies"}: ${strategies.join(", ")}`);
   if (manageOnly) console.log("(manage-only mode — no entry scans)");
+  if (forceRebalance) console.log("(force-rebalance — strategies may rebalance off-schedule)");
+  if (dryRun) console.log("(dry-run — orders logged, nothing submitted)");
 
   for (const s of strategies) {
     try {
-      await runStrategy(s, { manageOnly });
+      await runStrategy(s, { manageOnly, forceRebalance, dryRun });
     } catch (err) {
       console.error(`Fatal error running ${s}:`, err);
     }

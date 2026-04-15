@@ -1,0 +1,76 @@
+{
+  "name": "secmo",
+  "displayName": "Sector Momentum",
+  "version": 2,
+  "status": "killed",
+  "killedAt": "2026-04-14",
+  "killReason": "Two-strikes retirement. v1 (top-3, 3-month) failed pre-commit: Sharpe 0.59, DD 40.7%. v2 (top-1, 6-month, canonical Antonacci variant) also failed: Sharpe 0.51, DD 35.4%. Both versions cleared PF/CAGR/Z/N but consistently underperformed on Sharpe and drawdown. In-sample Sharpe 0.36 vs holdout 0.74 on v2 suggests higher regime-dependence than CATF. Sector momentum at this retail scale may not be viable without additional risk-management (vol-targeting, tighter absolute filter). Not pursued further.",
+  "thesis": "Within the US equity market, sectors rotate predictably as economic cycles shift — tech and discretionary lead early recovery, energy and materials lead late cycle, utilities and staples lead in downturns. Cross-sectional momentum (rank sectors by recent return, concentrate in the leader) captures these rotations. Published canonical variant is Antonacci's top-1 with 6-month lookback. Edge source is different from CATF's absolute cross-asset trend: this is relative strength within one asset class, CATF is time-series momentum across asset classes.",
+  "docLink": "docs/mandates/secmo.md",
+  "createdAt": "2026-04-14",
+
+  "broker": {
+    "type": "alpaca",
+    "account_env_prefix": "ALPACA"
+  },
+
+  "capital": {
+    "allocationPct": 0.25,
+    "startingEquity": 5000
+  },
+
+  "limits": {
+    "maxGrossExposurePct": 1.0,
+    "maxSinglePositionPct": 1.0,
+    "minCashReservePct": 0.0
+  },
+
+  "killSwitches": {
+    "maxDrawdownPct": 0.35,
+    "minSharpeAfterDays": { "days": 365, "minSharpe": 0.4 }
+  },
+
+  "expected": {
+    "cagr": [0.12, 0.16],
+    "maxDrawdown": [0.30, 0.40],
+    "sharpe": [0.8, 1.0]
+  },
+
+  "graduation": {
+    "paperDays": 180,
+    "minPaperCagrPct": 0.06,
+    "maxPaperDrawdownPct": 0.30
+  },
+
+  "strategy": {
+    "universe": [
+      { "symbol": "XLK",  "description": "Technology" },
+      { "symbol": "XLF",  "description": "Financials" },
+      { "symbol": "XLE",  "description": "Energy" },
+      { "symbol": "XLV",  "description": "Healthcare" },
+      { "symbol": "XLP",  "description": "Consumer staples" },
+      { "symbol": "XLY",  "description": "Consumer discretionary" },
+      { "symbol": "XLI",  "description": "Industrials" },
+      { "symbol": "XLB",  "description": "Materials" },
+      { "symbol": "XLU",  "description": "Utilities" },
+      { "symbol": "XLRE", "description": "Real estate" },
+      { "symbol": "XLC",  "description": "Communication services" }
+    ],
+    "cashProxy": "SHY",
+    "lookbackBars": 126,
+    "topN": 1,
+    "rebalanceFrequency": "monthly",
+    "rebalanceDay": "last_business_day",
+    "absoluteMomentumFilter": true,
+    "sizing": "concentrated"
+  },
+
+  "revisions": [
+    {
+      "date": "2026-04-14",
+      "by": "Reid",
+      "change": "v1 → v2: topN 3 → 1, lookbackBars 63 → 126, maxSinglePositionPct 0.40 → 1.0. Expected CAGR/Sharpe/DD ranges shifted upward to reflect the top-1 concentrated variant.",
+      "reason": "v1 (top-3, 3-month) failed pre-commit backtest on 2008-2024 data: Sharpe 0.59 (need 0.7), Max DD 40.7% (kill 35%). The rules I picked weren't the canonical published variant. Antonacci's documented top-1 / 6-month variant is simpler and has stronger published results (Sharpe 0.8-1.0, CAGR 12-16%). v2 is a *strategy redesign* based on literature, not a criteria relaxation — kill-switch DD stays at 35% and v2 must pass on the same bar v1 failed. Two-strikes rule: if v2 also fails, SECMO is retired entirely."
+    }
+  ]
+}

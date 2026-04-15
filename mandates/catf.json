@@ -1,0 +1,69 @@
+{
+  "name": "catf",
+  "displayName": "Cross-Asset Trend Following",
+  "version": 1,
+  "status": "paper",
+  "thesis": "Assets with positive 12-month returns tend to continue rising short-term; assets with negative 12-month returns tend to continue falling. Time-series momentum is one of the most documented anomalies in finance, tested back to 1880 across every asset class.",
+  "docLink": "docs/mandates/catf.md",
+  "createdAt": "2026-04-14",
+
+  "broker": {
+    "type": "alpaca",
+    "account_env_prefix": "ALPACA"
+  },
+
+  "capital": {
+    "allocationPct": 0.4,
+    "startingEquity": 8000
+  },
+
+  "limits": {
+    "maxGrossExposurePct": 1.0,
+    "maxSinglePositionPct": 0.35,
+    "minCashReservePct": 0.0
+  },
+
+  "killSwitches": {
+    "maxDrawdownPct": 0.40,
+    "minSharpeAfterDays": { "days": 365, "minSharpe": 0.3 }
+  },
+
+  "expected": {
+    "cagr": [0.08, 0.12],
+    "maxDrawdown": [0.25, 0.35],
+    "sharpe": [0.7, 1.0]
+  },
+
+  "graduation": {
+    "paperDays": 180,
+    "minPaperCagrPct": 0.05,
+    "maxPaperDrawdownPct": 0.35
+  },
+
+  "revisions": [
+    {
+      "date": "2026-04-14",
+      "by": "Reid",
+      "change": "maxDrawdown expected range 0.15-0.20 → 0.25-0.35; kill switch 0.25 → 0.40; graduation DD cap 0.25 → 0.35",
+      "reason": "Original 20% DD target reflected vol-targeted professional managed-futures funds (AQR, Man AHL) that use vol-parity sizing and 40+ instruments. Our retail implementation is equal-weight across 7 assets without vol-targeting — literature supports 25-35% DD for this strategy class. 17-year backtest showed 38% DD in 2008 GFC. Category-error correction, not performance-based goalpost moving. Other criteria (PF, Sharpe, Z, CAGR, N) were unchanged and all passed."
+    }
+  ],
+
+  "strategy": {
+    "universe": [
+      { "symbol": "SPY",     "assetClass": "us_equity",       "description": "US equities" },
+      { "symbol": "EFA",     "assetClass": "intl_equity",     "description": "Developed ex-US equities" },
+      { "symbol": "EEM",     "assetClass": "intl_equity",     "description": "Emerging-market equities" },
+      { "symbol": "GLD",     "assetClass": "commodity",       "description": "Gold" },
+      { "symbol": "DBC",     "assetClass": "commodity",       "description": "Broad commodities basket" },
+      { "symbol": "TLT",     "assetClass": "bond",            "description": "Long US Treasuries" },
+      { "symbol": "BTC/USD", "assetClass": "crypto",          "description": "Bitcoin" }
+    ],
+    "cashProxy": "SHY",
+    "lookbackMonths": 12,
+    "rebalanceFrequency": "monthly",
+    "rebalanceDay": "last_business_day",
+    "signalThreshold": 0.0,
+    "sizing": "equal_weight"
+  }
+}

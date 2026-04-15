@@ -1,0 +1,61 @@
+{
+  "name": "btcmo",
+  "displayName": "BTC Momentum",
+  "version": 1,
+  "status": "killed",
+  "killedAt": "2026-04-14",
+  "killReason": "Failed pre-commit backtest on 2015-2024 BTC data. Max DD 69.5% vs 50% kill threshold. Also holdout-period Sharpe 0.66 (below 0.70 bar). Strategy is real (full-period Sharpe 1.08, PF 3.74, CAGR 46.9%) but BTC's velocity makes the 200-day SMA filter too slow — it holds through the initial 40-50% of each crash before signal flips. Shorter SMA would be parameter tuning on the same data (goalpost moving). Not deployed.",
+  "thesis": "Crypto is the last major retail-dominated asset class with strong trending behavior. A simple 200-day moving average filter on BTC has historically captured most of the upside of buy-and-hold while avoiding the worst of bear-market drawdowns. Edge persists because crypto markets are still narrative-driven, lack institutional short capacity, and have multi-year cycles driven by halving schedules and adoption curves. This is a satellite / diversifier — not the fund's main return engine.",
+  "docLink": "docs/mandates/btcmo.md",
+  "createdAt": "2026-04-14",
+
+  "broker": {
+    "type": "alpaca",
+    "account_env_prefix": "ALPACA"
+  },
+
+  "capital": {
+    "allocationPct": 0.25,
+    "startingEquity": 5000
+  },
+
+  "limits": {
+    "maxGrossExposurePct": 1.0,
+    "maxSinglePositionPct": 1.0,
+    "minCashReservePct": 0.0
+  },
+
+  "killSwitches": {
+    "maxDrawdownPct": 0.50,
+    "minSharpeAfterDays": { "days": 365, "minSharpe": 0.5 }
+  },
+
+  "expected": {
+    "cagr": [0.25, 0.50],
+    "maxDrawdown": [0.30, 0.45],
+    "sharpe": [0.9, 1.3]
+  },
+
+  "graduation": {
+    "paperDays": 180,
+    "minPaperCagrPct": 0.10,
+    "maxPaperDrawdownPct": 0.40
+  },
+
+  "evaluation": {
+    "classification": "low-frequency-single-asset-trend",
+    "expectedTradesPerDecade": "15-25",
+    "skipCriteria": ["N_ge_50"],
+    "skipCriteriaReason": "Single-asset trend strategies generate few trades by design (signal flips ~2x/year). N≥50 is a frequency-based criterion that does not fit this strategy class. Pre-committed before backtest per feedback_mandate_revisions.md category-error rule. Strategy is evaluated on PF ≥ 1.3, Z ≥ 2.0, Sharpe ≥ 0.7, DD < kill, CAGR ≥ 10%."
+  },
+
+  "strategy": {
+    "universe": [
+      { "symbol": "BTC/USD", "description": "Bitcoin" }
+    ],
+    "cashProxy": "SHY",
+    "smaPeriod": 200,
+    "checkFrequency": "daily",
+    "rebalanceOn": "signal_change_only"
+  }
+}

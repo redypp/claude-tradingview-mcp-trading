@@ -1,0 +1,46 @@
+{
+  "name": "example",
+  "displayName": "Human-readable strategy name",
+  "version": 1,
+  "status": "paper",
+  "thesis": "One-sentence thesis for why this edge exists.",
+  "docLink": "docs/mandates/example.md",
+
+  "broker": {
+    "type": "alpaca",
+    "account_env_prefix": "ALPACA_PAPER"
+  },
+
+  "capital": {
+    "allocationPct": 0.5,
+    "startingEquity": 10000
+  },
+
+  "limits": {
+    "maxGrossExposurePct": 1.0,
+    "maxSinglePositionPct": 0.35,
+    "minCashReservePct": 0.0
+  },
+
+  "killSwitches": {
+    "maxDrawdownPct": 0.25,
+    "minSharpeAfterDays": { "days": 365, "minSharpe": 0.3 },
+    "maxConsecutiveLossDays": null
+  },
+
+  "expected": {
+    "cagr": [0.08, 0.12],
+    "maxDrawdown": [0.15, 0.20],
+    "sharpe": [0.7, 1.0]
+  },
+
+  "graduation": {
+    "paperDays": 180,
+    "minPaperCagrPct": 0.05,
+    "maxPaperDrawdownPct": 0.25
+  },
+
+  "strategy": {
+    "_comment": "Strategy-specific parameters — freeform, consumed by strategies/<name>.js"
+  }
+}

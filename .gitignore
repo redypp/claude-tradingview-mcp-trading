@@ -2,8 +2,13 @@
 *.log
 safety-check-log.json
 node_modules/
-backtest*results.json
-backtest-comparison.json
 trades.csv
 state/
+
+# Backtest artifacts (runtime, reproducible)
+backtest/cache/
+backtest/cache-yahoo/
+backtest/*-results.json
+backtest-results.json
+backtest-comparison.json
 backtest-dual-momentum-results.json

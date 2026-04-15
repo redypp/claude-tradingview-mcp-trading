@@ -1,0 +1,69 @@
+{
+  "name": "mr-rsi2",
+  "displayName": "Mean Reversion — RSI(2) on Quality S&P 500",
+  "version": 1,
+  "status": "killed",
+  "killedAt": "2026-04-14",
+  "killReason": "Failed pre-commit backtest on 2019-2024 data: PF 1.12 vs required 1.3, Sharpe 0.41 vs required 0.7, 4 of 6 criteria failed. Strategy is regime-dependent — lost money 2019-2022 (PF 0.90, Sharpe -0.21), worked 2023-2024 (PF 1.28, Sharpe 1.13). Not deployed. See backtest/mr-rsi2-results.json.",
+  "thesis": "Short-term oversold conditions in high-quality, uptrending stocks mean-revert within days. When a fundamentally sound stock in a long-term uptrend briefly sells off hard, institutional buyers step in to defend positions, producing a reliable bounce over 1-5 trading days.",
+  "docLink": "docs/mandates/mr-rsi2.md",
+  "createdAt": "2026-04-14",
+
+  "broker": {
+    "type": "alpaca",
+    "account_env_prefix": "ALPACA"
+  },
+
+  "capital": {
+    "allocationPct": 0.25,
+    "startingEquity": 5000
+  },
+
+  "limits": {
+    "maxGrossExposurePct": 1.0,
+    "maxSinglePositionPct": 0.15,
+    "minCashReservePct": 0.0
+  },
+
+  "killSwitches": {
+    "maxDrawdownPct": 0.20,
+    "minSharpeAfterDays": { "days": 365, "minSharpe": 0.5 }
+  },
+
+  "expected": {
+    "cagr": [0.08, 0.12],
+    "maxDrawdown": [0.10, 0.15],
+    "sharpe": [1.0, 1.3]
+  },
+
+  "graduation": {
+    "paperDays": 180,
+    "minPaperCagrPct": 0.05,
+    "maxPaperDrawdownPct": 0.20
+  },
+
+  "strategy": {
+    "universeSource": "sp500",
+    "screenFilters": {
+      "minPriceUsd": 10,
+      "minAvgDollarVolume": 10000000,
+      "aboveSma200": true
+    },
+    "entry": {
+      "rsiPeriod": 2,
+      "rsiEntryThreshold": 10,
+      "entryTiming": "next_open"
+    },
+    "exit": {
+      "rsiExitThreshold": 70,
+      "maxHoldDays": 5,
+      "stopLossPct": 0.05
+    },
+    "sizing": {
+      "mode": "equal_dollar",
+      "maxConcurrentPositions": 8,
+      "positionPctOfEquity": 0.125
+    },
+    "runSchedule": "daily_after_close"
+  }
+}

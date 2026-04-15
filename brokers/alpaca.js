@@ -29,8 +29,10 @@ export function createAlpacaClient({ apiKey, secretKey, baseUrl, dataUrl }) {
     "APCA-API-SECRET-KEY": secretKey,
   };
 
-  async function placeOrder({ symbol, side, notional, qty, type = "market", timeInForce = "day" }) {
-    const body = { symbol: symbol.replace("/", ""), side, type, time_in_force: timeInForce };
+  async function placeOrder({ symbol, side, notional, qty, type = "market", timeInForce }) {
+    const isCrypto = symbol.includes("/");
+    const tif = timeInForce || (isCrypto ? "gtc" : "day");
+    const body = { symbol: symbol.replace("/", ""), side, type, time_in_force: tif };
     if (notional != null) body.notional = Number(notional).toFixed(2);
     if (qty != null) body.qty = String(qty);
     const res = await fetch(`${baseUrl}/v2/orders`, {

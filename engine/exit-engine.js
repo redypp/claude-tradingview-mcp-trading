@@ -37,8 +37,9 @@ function findEntryContext(log, symbol) {
  * @param {object} opts.strategy — strategy module with shouldExit(position, context)
  * @param {object} opts.log — mutable log object (loaded via loadLog)
  * @param {object} opts.notify — notifier from createNotifier()
+ * @param {object} [opts.rules] — strategy-specific params from mandate.strategy
  */
-export async function managePositions({ broker, strategy, log, notify }) {
+export async function managePositions({ broker, strategy, log, notify, rules = {} }) {
   console.log(`\n══ [${strategy.name}] Managing Open Positions ═══════════\n`);
 
   let positions;
@@ -78,6 +79,7 @@ export async function managePositions({ broker, strategy, log, notify }) {
       log,
       daysHeld,
       entryContext: entryCtx,
+      rules,
       fetchCandles: (sym, interval, opts) => broker.fetchCandles(sym, interval, opts),
     };
 
