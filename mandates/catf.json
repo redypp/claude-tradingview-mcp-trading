@@ -13,8 +13,8 @@
   },
 
   "capital": {
-    "allocationPct": 0.4,
-    "startingEquity": 8000
+    "allocationPct": 1.0,
+    "startingEquity": 20000
   },
 
   "limits": {
@@ -46,6 +46,12 @@
       "by": "Reid",
       "change": "maxDrawdown expected range 0.15-0.20 → 0.25-0.35; kill switch 0.25 → 0.40; graduation DD cap 0.25 → 0.35",
       "reason": "Original 20% DD target reflected vol-targeted professional managed-futures funds (AQR, Man AHL) that use vol-parity sizing and 40+ instruments. Our retail implementation is equal-weight across 7 assets without vol-targeting — literature supports 25-35% DD for this strategy class. 17-year backtest showed 38% DD in 2008 GFC. Category-error correction, not performance-based goalpost moving. Other criteria (PF, Sharpe, Z, CAGR, N) were unchanged and all passed."
+    },
+    {
+      "date": "2026-04-28",
+      "by": "Reid",
+      "change": "allocationPct 0.4 → 1.0; startingEquity 8000 → 20000",
+      "reason": "Mandate originally assumed multi-strategy fund splitting a $20k paper bank. After 2026-04-14 strategy slate wipe, CATF is the only strategy on its own dedicated Alpaca paper account. Risk-manager syncEquity reads full broker equity ($20k), so mandate-driven startingEquity ($8k) was inconsistent with operational reality and broke dashboard P&L math. Category-error correction reflecting one-strategy-per-account architecture, not performance-based adjustment. Expected ranges, kill switches, and graduation criteria unchanged."
     }
   ],
 
